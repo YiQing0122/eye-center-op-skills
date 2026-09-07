@@ -1166,11 +1166,13 @@ async function generatePdfBlob(){
     sctx.fillStyle = "#ffffff";
     sctx.fillRect(0, 0, sliceCanvas.width, sliceCanvas.height);
     sctx.drawImage(canvas, 0, srcYpx, canvas.width, srcHpx, 0, 0, canvas.width, srcHpx);
-    const sliceData = sliceCanvas.toDataURL("image/png");
+    // 用高品質 JPEG（而非 PNG）壓縮每一頁：內容是白底文字，肉眼幾乎看不出差異，
+    // 但檔案大小可以從幾十 MB 降到幾 MB，PDF 才實際上傳得動 Google Drive、Email 也附得動。
+    const sliceData = sliceCanvas.toDataURL("image/jpeg", 0.92);
 
     if (!firstPage) pdf.addPage();
     firstPage = false;
-    pdf.addImage(sliceData, "PNG", 0, PDF_MARGIN_TOP_PT, imgWidth, slicePt);
+    pdf.addImage(sliceData, "JPEG", 0, PDF_MARGIN_TOP_PT, imgWidth, slicePt);
 
     contentTopPt = cutPt;
   }
@@ -1210,18 +1212,29 @@ function downloadBlobLocally(blob, filename){
 
 async function uploadPdfToDrive(blob, filename){
   if (!DRIVE_UPLOAD_URL) return { ok:false, error:"尚未設定 Google Drive 上傳網址" };
+  // 上傳逾時保護：網路不穩或檔案過大時，最多等 45 秒就會主動放棄，
+  // 不會讓「完成評核並產生 PDF」按鈕永遠卡在反灰、按不下去的狀態。
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
   try{
     const pdfBase64 = await blobToBase64(blob);
-    const resp = await fetch(DRIVE_UPLOAD_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" }, // 避免觸發 CORS 預檢請求，Apps Script 無法處理 OPTIONS
-      body: JSON.stringify({ filename, pdfBase64 })
-    });
+    let resp;
+    try{
+      resp = await fetch(DRIVE_UPLOAD_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" }, // 避免觸發 CORS 預檢請求，Apps Script 無法處理 OPTIONS
+        body: JSON.stringify({ filename, pdfBase64 }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     const json = await resp.json();
     return json;
   }catch(err){
     console.error(err);
-    return { ok:false, error:String(err) };
+    const timedOut = err && err.name === "AbortError";
+    return { ok:false, error: timedOut ? "上傳逾時（45 秒），請確認網路狀況或改用本機下載" : String(err) };
   }
 }
 
