@@ -873,10 +873,12 @@ function setupSignaturePad(key, canvasId){
   canvas.width = cssW * ratio;
   canvas.height = cssH * ratio;
   ctx.scale(ratio, ratio);
-  ctx.lineWidth = 2.2;
+  ctx.lineWidth = 2.6;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--ink").trim() || "#0d1e2e";
+  // 簽名固定用深色墨水，不跟隨畫面深色／淺色模式切換：
+  // PDF 報告一律是白底輸出，若簽名顏色跟著深色模式變成淺色，畫在白底上會幾乎看不見。
+  ctx.strokeStyle = "#0d1e2e";
 
   let drawing = false, dirty = false, last = null;
   function pos(e){ const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
