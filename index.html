@@ -1091,28 +1091,87 @@ function buildReportHtml(){
     </div>`;
 }
 
+// 每頁上／下留白（pt），避免內容緊貼紙張邊緣（列印時容易被裁切）
+const PDF_MARGIN_TOP_PT = 28;
+const PDF_MARGIN_BOTTOM_PT = 32;
+// 換頁時不可從中間切開的區塊（每個評核項目、區段標題、基本資料、重大安全指標、總分、簽名等）
+const PDF_NO_SPLIT_SELECTOR = ".rp-item, .rp-section, .rp-meta, .rp-critical, .rp-total, .rp-sign, .rp-roster";
+
 async function generatePdfBlob(){
   const root = document.getElementById("reportRoot");
   root.innerHTML = buildReportHtml();
   await new Promise(r=>setTimeout(r, 60));
+
+  const page = root.querySelector(".rp-page");
+  const pageRect = page.getBoundingClientRect();
+  const kids = Array.from(page.children);
+  // 收集「不可切開」區塊在內容中的上下邊界（DOM px，相對於 .rp-page 頂部）；
+  // 區段標題（rp-section）會跟著它後面第一個項目一起視為同一個不可切開的整體，避免標題被留在頁尾孤立。
+  const noSplitBlocks = [];
+  kids.forEach((el, i) => {
+    if (!el.matches(PDF_NO_SPLIT_SELECTOR)) return;
+    const r = el.getBoundingClientRect();
+    let top = r.top - pageRect.top, bottom = r.bottom - pageRect.top;
+    if (el.matches(".rp-section") && kids[i+1]){
+      const nr = kids[i+1].getBoundingClientRect();
+      bottom = Math.max(bottom, nr.bottom - pageRect.top);
+    }
+    noSplitBlocks.push({ top, bottom });
+  });
+
   const canvas = await html2canvas(root, {scale:2, backgroundColor:"#ffffff", useCORS:true, windowWidth:794});
   const { jsPDF } = window.jspdf;
   const pdf = new jsPDF("p","pt","a4");
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
   const imgWidth = pageWidth;
-  const imgHeight = canvas.height * imgWidth / canvas.width;
-  const imgData = canvas.toDataURL("image/png");
-  let heightLeft = imgHeight;
-  let position = 0;
-  pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
-  heightLeft -= pageHeight;
-  while (heightLeft > 0){
-    position = heightLeft - imgHeight;
-    pdf.addPage();
-    pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
-    heightLeft -= pageHeight;
+  const pxPerPt = canvas.width / imgWidth;                 // canvas 像素 / PDF pt
+  const domPxToCanvasPx = canvas.height / root.getBoundingClientRect().height; // DOM px 轉 canvas 像素
+  const imgHeightPt = canvas.height / pxPerPt;             // 整份內容換算成 PDF pt 的總高度
+  const usableHeightPt = pageHeight - PDF_MARGIN_TOP_PT - PDF_MARGIN_BOTTOM_PT;
+
+  const blocksPt = noSplitBlocks.map(b => ({
+    top: (b.top * domPxToCanvasPx) / pxPerPt,
+    bottom: (b.bottom * domPxToCanvasPx) / pxPerPt
+  }));
+
+  function findSafeCutPt(targetPt, floorPt){
+    let cut = targetPt;
+    for (const b of blocksPt){
+      if (cut > b.top + 0.5 && cut < b.bottom - 0.5) cut = b.top;
+    }
+    // 若退回後幾乎沒有內容可放（單一區塊本身就比一頁還高等極端狀況），放棄避讓、直接切在原位置
+    if (cut <= floorPt + 20) cut = targetPt;
+    return cut;
   }
+
+  const sliceCanvas = document.createElement("canvas");
+  const sctx = sliceCanvas.getContext("2d");
+
+  let contentTopPt = 0;
+  let firstPage = true;
+  while (contentTopPt < imgHeightPt - 0.5){
+    const targetPt = Math.min(contentTopPt + usableHeightPt, imgHeightPt);
+    const cutPt = (imgHeightPt - targetPt < 0.5) ? imgHeightPt : findSafeCutPt(targetPt, contentTopPt);
+    const slicePt = Math.max(cutPt - contentTopPt, 1);
+
+    const srcYpx = Math.round(contentTopPt * pxPerPt);
+    const srcHpx = Math.max(1, Math.min(Math.round(slicePt * pxPerPt), canvas.height - srcYpx));
+
+    sliceCanvas.width = canvas.width;
+    sliceCanvas.height = srcHpx;
+    sctx.fillStyle = "#ffffff";
+    sctx.fillRect(0, 0, sliceCanvas.width, sliceCanvas.height);
+    sctx.drawImage(canvas, 0, srcYpx, canvas.width, srcHpx, 0, 0, canvas.width, srcHpx);
+    const sliceData = sliceCanvas.toDataURL("image/png");
+
+    if (!firstPage) pdf.addPage();
+    firstPage = false;
+    pdf.addImage(sliceData, "PNG", 0, PDF_MARGIN_TOP_PT, imgWidth, slicePt);
+
+    contentTopPt = cutPt;
+  }
+
   return pdf.output("blob");
 }
 
