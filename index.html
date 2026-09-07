@@ -454,7 +454,7 @@ function metaFieldsFor(exam){
 
 /* ---------------- home ---------------- */
 function renderHome(){
-  const typeLabel = {rubric:"技能量表", knowledge:"知識評核", checklist:"熟悉度評核", certification:"認證歷程"};
+  const typeLabel = {rubric:"技能量表", knowledge:"知識評核", checklist:"熟悉度評核", certification:"認證歷程", mixed:"認證歷程"};
   $("#homeGrid").innerHTML = EXAMS.map(ex => `
     <button type="button" class="home-card" data-open="${ex.id}">
       <div class="hc-top"><span class="hc-icon">${ex.icon}</span><span class="hc-type">${typeLabel[ex.type]}</span></div>
@@ -1212,29 +1212,47 @@ function downloadBlobLocally(blob, filename){
 
 async function uploadPdfToDrive(blob, filename){
   if (!DRIVE_UPLOAD_URL) return { ok:false, error:"尚未設定 Google Drive 上傳網址" };
-  // 上傳逾時保護：網路不穩或檔案過大時，最多等 45 秒就會主動放棄，
-  // 不會讓「完成評核並產生 PDF」按鈕永遠卡在反灰、按不下去的狀態。
+  console.info(`[Drive 上傳] 檔名：${filename}，PDF 大小：${(blob.size/1024/1024).toFixed(2)} MB`);
+
+  const UPLOAD_TIMEOUT_MS = 45000;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000);
-  try{
+
+  async function doUpload(){
     const pdfBase64 = await blobToBase64(blob);
-    let resp;
+    const resp = await fetch(DRIVE_UPLOAD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // 避免觸發 CORS 預檢請求，Apps Script 無法處理 OPTIONS
+      body: JSON.stringify({ filename, pdfBase64 }),
+      signal: controller.signal
+    });
+    // 用 text() 而非 json()：即使伺服器端（或 Google 基礎設施）在真正執行 Apps Script 前
+    // 就先擋下請求、回傳非 JSON 的錯誤頁面，也能得到清楚訊息，而不是被 json() 直接拋出難以理解的例外。
+    const text = await resp.text();
     try{
-      resp = await fetch(DRIVE_UPLOAD_URL, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" }, // 避免觸發 CORS 預檢請求，Apps Script 無法處理 OPTIONS
-        body: JSON.stringify({ filename, pdfBase64 }),
-        signal: controller.signal
-      });
-    } finally {
-      clearTimeout(timeoutId);
+      return JSON.parse(text);
+    }catch(parseErr){
+      const snippet = (text || "").slice(0, 120).replace(/\s+/g," ").trim();
+      throw new Error(`伺服器回應非預期格式（HTTP ${resp.status}）：${snippet || "（空白回應）"}`);
     }
-    const json = await resp.json();
-    return json;
+  }
+
+  // 用 Promise.race 包住「整個」上傳流程（而非只有 fetch 本身）：
+  // 就算卡在讀取回應內容（resp.text()）這一步，也保證最多 45 秒後這個函式一定會回傳，
+  // 「完成評核並產生 PDF」按鈕就不會再永遠反灰卡死。
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => { controller.abort(); reject(new Error("TIMEOUT")); }, UPLOAD_TIMEOUT_MS);
+  });
+
+  try{
+    const result = await Promise.race([doUpload(), timeoutPromise]);
+    return result;
   }catch(err){
-    console.error(err);
-    const timedOut = err && err.name === "AbortError";
-    return { ok:false, error: timedOut ? "上傳逾時（45 秒），請確認網路狀況或改用本機下載" : String(err) };
+    console.error("[Drive 上傳失敗]", err);
+    const timedOut = err && err.message === "TIMEOUT";
+    return { ok:false, error: timedOut ? "上傳逾時（45 秒），請確認網路狀況或改用本機下載" : String((err && err.message) || err) };
+  }finally{
+    clearTimeout(timeoutId);
   }
 }
 
@@ -1292,7 +1310,8 @@ async function handleFinish(){
       if (driveResult && driveResult.ok){
         toast("已同步上傳至 Google Drive。");
       } else {
-        toast("Google Drive 同步失敗（PDF 已保留在本機），請聯繫系統管理者。", true);
+        const errMsg = (driveResult && driveResult.error) ? driveResult.error : "原因不明，請查看瀏覽器主控台（Console）";
+        toast(`Google Drive 同步失敗：${errMsg}（PDF 已保留在本機）`, true);
       }
     }
 
